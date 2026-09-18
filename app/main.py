@@ -32,6 +32,14 @@
   invalid schemas and unresolvable local references yield 422. A valid
   schema always yields 200 with ``valid`` and (on failure) every leaf
   error as RFC 6901 paths, sorted by instance path and keyword.
+
+* ``POST /redact`` accepts ``{"document": ..., "rules": [...]}`` and
+  applies ``remove`` / ``mask`` / ``hash`` rules located by JSON Pointer
+  globs (``*`` one level, ``**`` any depth). All rules are validated
+  first; when several rules hit one path the one with fewer wildcards,
+  then the longer path, then the earlier declaration wins. The response
+  carries the redacted document and every applied hit as an RFC 6901
+  path; the input document is never modified.
 """
 
 from __future__ import annotations
@@ -47,9 +55,10 @@ from .canonicalize import CanonicalizationError, canonicalize
 from .diff import make_patch
 from .jsonutil import MISSING, escape_pointer, json_equal
 from .patch import PatchConflict, PatchStructureError, apply_patch
+from .redact import RedactionConflict, RedactionError, redact
 from .validate import SchemaValidationError, build_validator, leaf_errors
 
-app = FastAPI(title="JSON Merge, Patch, Diff, Validate & Canonicalize Service", version="1.4.0")
+app = FastAPI(title="JSON Merge, Patch, Diff, Validate, Canonicalize & Redact Service", version="1.5.0")
 
 
 def merge3(base: Any, left: Any, right: Any, path: str, conflicts: list) -> Any:
@@ -219,3 +228,36 @@ def validate_endpoint(request: ValidateRequest):
     if errors:
         return {"valid": False, "errors": errors}
     return {"valid": True, "errors": []}
+
+
+class RedactRequest(BaseModel):
+    document: Any = Field(...)
+    rules: list = Field(...)
+
+
+@app.post("/redact")
+def redact_endpoint(request: RedactRequest):
+    try:
+        document, hits = redact(request.document, request.rules)
+    except RedactionError as exc:
+        content: dict = {"detail": "invalid redaction rule", "reason": exc.reason}
+        if exc.reason.startswith("value cannot be hashed"):
+            # The rule is well formed; the value it matched cannot be
+            # serialized (RFC 8785), so the request cannot be fulfilled.
+            content["detail"] = "value cannot be hashed"
+        if exc.index >= 0:
+            content["failed_index"] = exc.index
+        if isinstance(exc.path, str):
+            content["path"] = exc.path
+        return JSONResponse(status_code=422, content=content)
+    except RedactionConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "redaction conflict",
+                "failed_index": exc.index,
+                "path": exc.path,
+                "reason": exc.reason,
+            },
+        )
+    return {"document": document, "hits": hits}
