@@ -1,6 +1,6 @@
-# JSON Merge, Patch, Diff, Validate & Canonicalize Service
+# JSON Merge, Patch, Diff, Validate, Redact & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供五个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供六个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -18,6 +18,11 @@
 - `POST /canonicalize`：接收任意 JSON `document`，按
   [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)（JCS）生成无空白、确定性的
   规范 JSON 文本，并返回其 SHA-256 摘要。
+- `POST /redact`：接收 `document` 与一组 `rules`，规则用 JSON Pointer glob
+  （`*` 匹配单层、`**` 匹配任意深度、数组索引也可用 `*`）定位字段，按
+  `remove` / `mask` / `hash` 动作在深拷贝上脱敏；先校验全部规则，多个规则命中
+  同一路径时按“通配符更少 → 路径更长 → 声明在前”裁决，返回脱敏文档与全部命中
+  的 RFC 6901 路径。
 
 ## 快速开始
 
@@ -376,6 +381,137 @@ JCS 不允许的值（如超出 IEEE 754 double 范围的整数）同样返回 `
 { "detail": "document cannot be canonicalized", "reason": "..." }
 ```
 
+### `POST /redact`
+
+请求体含两个字段：
+
+| 字段       | 类型      | 说明                                   |
+| ---------- | --------- | -------------------------------------- |
+| `document` | 任意 JSON | 待脱敏的文档（不会被修改）             |
+| `rules`    | 数组      | 脱敏规则，按声明顺序考量               |
+
+每条规则是一个对象：
+
+| 字段     | 类型   | 说明                                                                 |
+| -------- | ------ | -------------------------------------------------------------------- |
+| `path`   | 字符串 | JSON Pointer glob：`/` 分隔、按 RFC 6901 转义；token `*` 匹配任意**单层**（对象成员或数组元素），`**` 匹配**任意深度**（含零层）；数组位置可用数字索引或 `*` |
+| `action` | 字符串 | `remove`（删除该成员/元素）、`mask`（替换为 `"***"`）、`hash`（替换为该值的 SHA-256，见下） |
+
+```json
+{
+  "document": {
+    "users": [
+      { "name": "ada", "password": "s3cret",  "email": "ada@example.com" },
+      { "name": "bob", "password": "hunter2", "email": "bob@example.com" }
+    ],
+    "debug": { "trace": ["a", "b"] }
+  },
+  "rules": [
+    { "path": "/users/*/password", "action": "hash"   },
+    { "path": "/users/*/email",    "action": "mask"   },
+    { "path": "/debug",            "action": "remove" }
+  ]
+}
+```
+
+**成功 → `200`**，返回脱敏文档与全部命中路径：
+
+```json
+{
+  "document": {
+    "users": [
+      {
+        "name": "ada",
+        "password": "1c1a4d952bd7a5c0943e671c96557c94fa871433ae37b06a8cda610d621463b9",
+        "email": "***"
+      },
+      {
+        "name": "bob",
+        "password": "4ddbb67bf993867e13253c146a339ed3b33ea5b895543569278e99d5b3c2b7d5",
+        "email": "***"
+      }
+    ]
+  },
+  "matched": [
+    "/debug",
+    "/users/0/email",
+    "/users/0/password",
+    "/users/1/email",
+    "/users/1/password"
+  ]
+}
+```
+
+- `matched` 列出**至少被一条规则命中**的全部路径（RFC 6901，根为空字符串
+  `""`），同一路径只出现一次；排序沿用 `/validate` 的规则：数组索引按数值
+  排在成员名前，成员名按 Unicode 码点。
+- 脱敏在 `document` 的**深拷贝**上进行，请求中的文档不会被修改。
+
+#### glob 语义
+
+- 模式先按 RFC 6901 解析（`~1` → `/`、`~0` → `~`），再逐 token 匹配；只有
+  完整的 `*`、`**` 两个 token 是通配符，`*a`、`a*` 等都是字面键名。
+- `*` 匹配恰好一层：对象的任一成员，或数组的任一元素（不能作用于标量）。
+- `**` 匹配零层或更多层：`/**/password` 同时命中 `/password`、`/a/password`、
+  `/a/b/password`；`/a/**` 命中 `/a` 自身及其全部子孙；`/**` 命中包括根在内的
+  所有路径。
+- 数字 token（如 `/l/0`）在数组上按索引匹配、在对象上按键名 `"0"` 匹配；
+  越界索引、带前导零的 `/01`、`-` 等在数组上不匹配任何元素（不报错），但在
+  对象上仍可匹配同名字面键。
+- 所有规则都针对**原始文档**匹配，规则之间互不影响彼此的匹配结果。
+
+#### 命中裁决与应用顺序
+
+多个规则命中同一路径时，只有一条规则的 action 生效，优先级依次为：
+
+1. **通配符更少**的规则优先（`*`、`**` 各计一个通配符）；
+2. **路径 token 更多**的规则优先；
+3. **声明在前**的规则优先。
+
+胜出动作按以下顺序应用到深拷贝上，使所有路径始终按原始文档寻址：
+
+1. 先做全部替换（`mask` / `hash`），深路径优先；
+2. 再做全部删除（`remove`），深路径优先、同一数组内高索引优先——因此一次
+   删除不会让另一次删除的目标错位；
+3. 目标已被祖先的替换/删除覆盖的动作自动跳过（其路径仍计入 `matched`）。
+
+`hash` 把值替换为其 **RFC 8785 规范 JSON 文本**（UTF-8）的 SHA-256 十六进制
+摘要——与 `/canonicalize` 对该值返回的 `sha256` 完全一致，且取的是**原始值**
+（即使另一条规则删除了它的子孙）。因此 `1` 与 `1.0` 的摘要相同，字符串
+`"1"` 与数字 `1` 的摘要不同。
+
+**`remove` 命中根路径（`""` 或经 `/**` 等 glob 命中）→ `409`**：
+
+```json
+{
+  "detail": "redact conflict",
+  "failed_index": 1,
+  "path": "",
+  "reason": "'remove' cannot target the whole document"
+}
+```
+
+`failed_index` 为胜出规则在 `rules` 中的下标（从 0 开始）。
+
+**规则非法 → `422`**（在任何匹配发生前检出，`failed_index` 为非法规则的下标）：
+
+- `rules` 不是数组，或某条规则不是对象；
+- 缺少 `action` / `path`，或 `path` 不是字符串；
+- `action` 不是 `remove` / `mask` / `hash`；
+- JSON Pointer 非空且不以 `/` 开头、`~` 后不是 `0`/`1`。
+
+```json
+{
+  "detail": "invalid redact rule",
+  "reason": "malformed JSON Pointer: non-empty pointer must start with '/'",
+  "failed_index": 1,
+  "path": "b"
+}
+```
+
+`hash` 的目标值无法按 RFC 8785 规范化（如超出 IEEE 754 double 范围的整数）时
+同样返回 `422`：`{"detail": "value cannot be hashed", "reason": "..."}`。
+
 ### `GET /health`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -458,6 +594,35 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/validate 
   -H 'Content-Type: application/json' \
   -d '{"schema":{"$ref":"#/$defs/nope"},"document":{}}'
 # => 422
+
+# 脱敏：glob 定位 + hash/mask/remove
+curl -s -X POST http://localhost:8000/redact \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"users":[{"name":"ada","password":"s3cret"}],"debug":true},
+       "rules":[{"path":"/users/*/password","action":"hash"},
+                {"path":"/debug","action":"remove"}]}'
+# => {"document":{"users":[{"name":"ada","password":"1c1a4d95..."}]},
+#     "matched":["/debug","/users/0/password"]}
+
+# 命中裁决：/a/b 命中两条规则，通配符更少的 /a/b（mask）胜出
+curl -s -X POST http://localhost:8000/redact \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":{"b":1,"c":2}},
+       "rules":[{"path":"/a/*","action":"remove"},
+                {"path":"/a/b","action":"mask"}]}'
+# => {"document":{"a":{"b":"***"}},"matched":["/a/b","/a/c"]}
+
+# remove 命中根路径 → 409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/redact \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":1},"rules":[{"path":"/**","action":"remove"}]}'
+# => 409
+
+# 非法规则 → 422（在任何匹配发生前检出）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/redact \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"a":1},"rules":[{"path":"a","action":"mask"}]}'
+# => 422
 ```
 
 ## 测试
@@ -470,17 +635,19 @@ pytest
 ## 项目结构
 
 ```
-app/main.py           # FastAPI 应用：/merge、/patch、/diff、/validate 与 /canonicalize 入口
+app/main.py           # FastAPI 应用：/merge、/patch、/diff、/validate、/redact 与 /canonicalize 入口
 app/patch.py          # RFC 6902 JSON Patch 校验与原子执行
 app/diff.py           # RFC 6902 diff 生成：对象递归比较、数组 LCS 对齐
 app/validate.py       # JSON Schema Draft 2020-12 校验、仅本地 # 引用与叶子错误收集
 app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
+app/redact.py         # JSON Pointer glob 匹配、命中裁决与脱敏动作应用
 app/jsonutil.py       # JSON 相等性、MISSING 哨兵与 RFC 6901 转义（接口共用）
 tests/test_merge.py        # /merge 测试
 tests/test_patch.py        # /patch 测试
 tests/test_diff.py         # /diff 测试（含 diff→/patch 随机往返）
 tests/test_validate.py     # /validate 测试
 tests/test_canonicalize.py # /canonicalize 测试
+tests/test_redact.py       # /redact 测试
 requirements.txt     # 运行依赖（Docker 构建时自动安装）
 requirements-dev.txt # 测试依赖
 Dockerfile
